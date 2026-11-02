@@ -29,6 +29,7 @@ import sys
 import time
 import unicodedata
 import uuid
+from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterator
@@ -40,6 +41,7 @@ from pydantic import BaseModel, Field
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import create_react_agent
 
@@ -47,6 +49,7 @@ from langgraph.prebuilt import create_react_agent
 # Configuración
 # ---------------------------------------------------------------------------
 SQLITE_PATH = Path("gastos_empresa.db").resolve()
+CHAT_MEMORY_PATH = Path("memoria_conversacion.sqlite").resolve()
 RESULTS_CSV = Path("resultados_comparacion.csv").resolve()
 MAX_ROWS = 50
 
@@ -366,14 +369,52 @@ def make_llm(backend: str, model: str, temperature: float = 0.0):
     raise ValueError(f"Backend desconocido: {backend}")
 
 
-_AGENTS: dict[tuple[str, str], object] = {}
+_AGENTS: dict[tuple[str, str, bool], object] = {}
+_CHAT_CHECKPOINTER: SqliteSaver | None = None
 
 
-def get_agent(backend: str, model: str):
-    key = (backend, model)
+def get_chat_thread_id() -> str:
+    """Devuelve el identificador de chat guardado entre ejecuciones."""
+    with closing(sqlite3.connect(CHAT_MEMORY_PATH)) as con:
+        with con:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            row = con.execute(
+                "SELECT value FROM app_state WHERE key = 'active_chat_thread_id'"
+            ).fetchone()
+            if row:
+                return row[0]
+            thread_id = str(uuid.uuid4())
+            con.execute(
+                "INSERT INTO app_state (key, value) VALUES ('active_chat_thread_id', ?)",
+                (thread_id,),
+            )
+            return thread_id
+
+
+def _get_chat_checkpointer() -> SqliteSaver:
+    global _CHAT_CHECKPOINTER
+    if _CHAT_CHECKPOINTER is None:
+        connection = sqlite3.connect(CHAT_MEMORY_PATH, check_same_thread=False, timeout=30)
+        checkpointer = SqliteSaver(connection)
+        try:
+            checkpointer.setup()
+        except Exception:
+            connection.close()
+            raise
+        _CHAT_CHECKPOINTER = checkpointer
+    return _CHAT_CHECKPOINTER
+
+
+def get_agent(backend: str, model: str, persistent_memory: bool = False):
+    key = (backend, model, persistent_memory)
     if key not in _AGENTS:
         _AGENTS[key] = create_react_agent(
-            model=make_llm(backend, model), tools=TOOLS, prompt=SYSTEM_PROMPT, checkpointer=InMemorySaver()
+            model=make_llm(backend, model),
+            tools=TOOLS,
+            prompt=SYSTEM_PROMPT,
+            checkpointer=_get_chat_checkpointer() if persistent_memory else InMemorySaver(),
         )
     return _AGENTS[key]
 
@@ -623,15 +664,15 @@ def chat_fn(message, history, backend, model, thread_id, api_key):
     if (msg := _need_key(backend)):
         history += [{"role": "user", "content": message}, {"role": "assistant", "content": f"⚠️ {msg}"}]
         return "", history, "", ""
-    res = run_agent(get_agent(backend, model), message, thread_id)
+    res = run_agent(get_agent(backend, model, persistent_memory=True), message, thread_id)
     reply = res["answer"] or f"⚠️ Error: {res['error']}"
     history += [{"role": "user", "content": message}, {"role": "assistant", "content": reply}]
     stats = (f"⏱️ {res['latency']:.1f}s · 🔧 {res['tool_calls']} llamadas a herramientas · 🔤 {res['tokens']} tokens")
     return "", history, res["trace"], stats
 
 
-def clear_chat():
-    return [], str(uuid.uuid4()), "", ""
+def clear_chat(thread_id: str):
+    return [], thread_id, "", ""
 
 
 def update_model_choices(backend):
@@ -701,12 +742,12 @@ def build_ui() -> gr.Blocks:
             with gr.Tab("💬 Chat"):
                 model = gr.Dropdown(DEFAULT_GROQ_MODELS, value=DEFAULT_GROQ_MODELS[0], allow_custom_value=True,
                                     label="Modelo")
-                thread_id = gr.State(str(uuid.uuid4()))
+                thread_id = gr.State(get_chat_thread_id())
                 chatbot = gr.Chatbot(type="messages", height=420, label="Conversación (con memoria)")
                 with gr.Row():
                     box = gr.Textbox(placeholder="Ej: ¿Cuánto gastamos en 'comida'?", scale=5, show_label=False)
                     send = gr.Button("Enviar", variant="primary", scale=1)
-                    clear = gr.Button("🧹 Nueva conversación", scale=1)
+                    clear = gr.Button("🧹 Limpiar pantalla (conservar memoria)", scale=1)
                 stats = gr.Markdown()
                 with gr.Accordion("🔍 Traza del agente (acciones y observaciones)", open=False):
                     trace = gr.Markdown()
@@ -720,7 +761,7 @@ def build_ui() -> gr.Blocks:
                 outs = [box, chatbot, trace, stats]
                 box.submit(chat_fn, ins, outs)
                 send.click(chat_fn, ins, outs)
-                clear.click(clear_chat, None, [chatbot, thread_id, trace, stats])
+                clear.click(clear_chat, thread_id, [chatbot, thread_id, trace, stats])
 
             # ---------------- Comparador ----------------
             with gr.Tab("📊 Comparador de modelos"):

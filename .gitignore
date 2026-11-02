@@ -4,6 +4,7 @@ __pycache__/
 *.db
 *.sqlite
 *.sqlite3
+memoria_conversacion.sqlite
 resultados_comparacion.csv
 .env
 .vscode/
